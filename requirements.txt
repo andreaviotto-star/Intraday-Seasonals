@@ -6,4 +6,4 @@ yfinance
 requests
 python-dotenv
 pytz
-
+scipy
