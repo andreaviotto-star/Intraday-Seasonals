@@ -1,4 +1,4 @@
-# app.py  —  Institutional Intraday Seasonals Dashboard
+# app.py  —  v3: Market Holidays + Half-Day Sessions filters
 import pytz
 import os
 import threading
@@ -30,7 +30,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 def start_background_downloader():
     def fetch_all_silently():
         ts = TradeStationFetcher()
-        end_d = datetime.now()
+        end_d   = datetime.now()
         start_d = end_d - timedelta(days=365 * 10)
         for sym in SYMBOLS:
             file_path = os.path.join(CACHE_DIR, f"{sym}_local_cache.csv")
@@ -41,7 +41,7 @@ def start_background_downloader():
                 df = ts.get_intraday_bars(sym, start=start_d, end=end_d, interval="5")
                 if not df.empty:
                     df.to_csv(tmp_path)
-                    os.replace(tmp_path, file_path)   # atomic write
+                    os.replace(tmp_path, file_path)
             except Exception:
                 try:
                     df = fetch_yfinance(sym, start=start_d, end=end_d, freq="5m")
@@ -62,24 +62,31 @@ start_background_downloader()
 # SIDEBAR
 # ─────────────────────────────────────────────
 st.sidebar.title("Intraday Seasonals")
-symbol        = st.sidebar.selectbox("Symbol", SYMBOLS)
-period_label  = st.sidebar.radio("Period", list(PERIODS.keys()))
-years         = PERIODS[period_label]
+symbol       = st.sidebar.selectbox("Symbol", SYMBOLS)
+period_label = st.sidebar.radio("Period", list(PERIODS.keys()))
+years        = PERIODS[period_label]
 
+st.sidebar.markdown("**Exclude Event Days:**")
 event_filters = st.sidebar.multiselect(
-    "Exclude High-Volatility Events:",
+    "High-Impact Macro Events",
     ["NFP", "FOMC", "CPI", "PCE", "Triple Witching", "End-of-Month"],
     default=[]
 )
+calendar_filters = st.sidebar.multiselect(
+    "CME Calendar Anomalies",
+    ["Market Holidays", "Half-Day Sessions"],
+    default=[]
+)
+all_filters = event_filters + calendar_filters
 
 tz_mode = st.sidebar.radio("Time zone", ["US futures (EST)", "Zürich (CET)"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Edge Score Thresholds")
-min_win_rate      = st.sidebar.slider("Min Win Rate (%)",      50.0, 70.0, 55.0, 0.5)
-min_profit_factor = st.sidebar.slider("Min Profit Factor",      1.0,  3.0,  1.2, 0.1)
-max_p_value       = st.sidebar.slider("Max p-value",           0.01,  0.10, 0.05, 0.01)
-min_obs           = st.sidebar.slider("Min Observations (N)",    20,   100,   30,    5)
+min_win_rate      = st.sidebar.slider("Min Win Rate (%)",    50.0, 70.0, 55.0, 0.5)
+min_profit_factor = st.sidebar.slider("Min Profit Factor",    1.0,  3.0,  1.2, 0.1)
+max_p_value       = st.sidebar.slider("Max p-value",         0.01, 0.10, 0.05, 0.01)
+min_obs           = st.sidebar.slider("Min Observations (N)", 20,  100,   30,    5)
 
 
 # ─────────────────────────────────────────────
@@ -109,18 +116,13 @@ def get_raw_data(sym: str):
 
 
 @st.cache_data(show_spinner=False)
-def calculate_seasonals(df_raw, years_lookback, events, tz_setting,
+def calculate_seasonals(df_raw, years_lookback, filters, tz_setting,
                         end_reference, obs_gate, sym):
-    """
-    NOTE: end_reference and sym are explicit cache-key parameters.
-    end_reference ensures the cache invalidates on date change.
-    """
     cutoff = pd.to_datetime(
         datetime.strptime(end_reference, "%Y-%m-%d") - timedelta(days=365 * years_lookback),
         utc=True
     )
     df = df_raw.copy()
-
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df = df[df.index >= cutoff]
@@ -130,15 +132,14 @@ def calculate_seasonals(df_raw, years_lookback, events, tz_setting,
     else:
         df.index = df.index.tz_convert("America/New_York")
 
-    for evt in events:
+    for evt in filters:
         df = apply_event_filter(df, evt)
 
     if df.empty or len(df) < 50:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    path      = compute_avg_path(df, freq="15min", anchor="open", symbol=sym,
-                                 min_obs=obs_gate)
-    heatmap   = compute_heatmap_grid(df, freq="30min", symbol=sym)
+    path       = compute_avg_path(df, freq="15min", anchor="open", symbol=sym, min_obs=obs_gate)
+    heatmap    = compute_heatmap_grid(df, freq="30min", symbol=sym)
     daily_perf = compute_daily_performance(df, symbol=sym)
     hourly_vol = compute_hourly_volatility(df, symbol=sym)
 
@@ -157,13 +158,8 @@ if raw_df_full.empty:
 
 with st.spinner("Crunching math..."):
     PathData, HeatmapData, DailyPerf, HourlyVol = calculate_seasonals(
-        raw_df_full,
-        years,
-        tuple(event_filters),
-        tz_mode,
-        end_dt.strftime("%Y-%m-%d"),   # explicit date → correct cache invalidation
-        min_obs,
-        symbol
+        raw_df_full, years, tuple(all_filters), tz_mode,
+        end_dt.strftime("%Y-%m-%d"), min_obs, symbol
     )
 
 if PathData.empty:
@@ -175,7 +171,13 @@ if PathData.empty:
 # HEADER
 # ─────────────────────────────────────────────
 st.write(f"### {symbol} – {period_label} Institutional Analysis")
-st.caption(f"Data source: {source} • Engine: 24/7 Futures Data")
+
+# Show active filter summary
+active = []
+if event_filters:   active.append(f"Macro: {', '.join(event_filters)}")
+if calendar_filters: active.append(f"Calendar: {', '.join(calendar_filters)}")
+filter_str = " | ".join(active) if active else "No filters applied"
+st.caption(f"Data source: {source}  •  Filters: {filter_str}")
 
 
 # ─────────────────────────────────────────────
@@ -184,34 +186,23 @@ st.caption(f"Data source: {source} • Engine: 24/7 Futures Data")
 st.markdown("---")
 st.subheader("📊 Ranked Edge Opportunities")
 st.caption(
-    f"Slots passing: Win Rate ≥ {min_win_rate}% | "
+    f"Win Rate ≥ {min_win_rate}% | "
     f"Profit Factor ≥ {min_profit_factor} | "
     f"p-value ≤ {max_p_value} | N ≥ {min_obs}"
 )
 
-edge_df = compute_edge_score(
-    PathData,
-    min_win_rate=min_win_rate,
-    min_profit_factor=min_profit_factor,
-    max_p_value=max_p_value
-)
+edge_df = compute_edge_score(PathData, min_win_rate=min_win_rate,
+                              min_profit_factor=min_profit_factor,
+                              max_p_value=max_p_value)
 
 if not edge_df.empty:
-    display_cols = ["label", "avg", "median", "win_rate", "profit_factor",
-                    "t_stat", "p_value", "sharpe", "sortino", "kelly", "count"]
-    display_cols = [c for c in display_cols if c in edge_df.columns]
-    fmt = {
-        "avg":           "{:.3f}%",
-        "median":        "{:.3f}%",
-        "win_rate":      "{:.1f}%",
-        "profit_factor": "{:.2f}",
-        "t_stat":        "{:.2f}",
-        "p_value":       "{:.4f}",
-        "sharpe":        "{:.2f}",
-        "sortino":       "{:.2f}",
-        "kelly":         "{:.3f}",
-        "count":         "{:.0f}",
-    }
+    display_cols = [c for c in
+        ["label","avg","median","win_rate","profit_factor",
+         "t_stat","p_value","sharpe","sortino","kelly","count"]
+        if c in edge_df.columns]
+    fmt = {"avg":"{:.3f}%","median":"{:.3f}%","win_rate":"{:.1f}%",
+           "profit_factor":"{:.2f}","t_stat":"{:.2f}","p_value":"{:.4f}",
+           "sharpe":"{:.2f}","sortino":"{:.2f}","kelly":"{:.3f}","count":"{:.0f}"}
     st.dataframe(
         edge_df[display_cols].head(10).style.format(
             {k: v for k, v in fmt.items() if k in display_cols}
@@ -219,45 +210,37 @@ if not edge_df.empty:
         use_container_width=True
     )
 else:
-    st.warning("No time slots pass the selected institutional thresholds. Try relaxing the filters.")
+    st.warning("No time slots pass the selected thresholds. Try relaxing the filters.")
 
 
 # ─────────────────────────────────────────────
 # SECTION 2: TRADE RECOMMENDATION
-# (only shown when a statistically valid edge exists)
 # ─────────────────────────────────────────────
 st.markdown("---")
 st.subheader("💡 Seasonal Edge Recommendation")
 
 if not edge_df.empty:
-    top_slot   = edge_df.iloc[0]
-    top_label  = top_slot["label"] if "label" in top_slot else "—"
-    top_avg    = top_slot["avg"]
-    top_wr     = top_slot["win_rate"]
-    top_sharpe = top_slot.get("sharpe", float("nan"))
-    top_kelly  = top_slot.get("kelly",  float("nan"))
-    top_n      = int(top_slot.get("count", 0))
-
+    top = edge_df.iloc[0]
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.success(f"**Best Entry Slot:**\n### {top_label}")
+        st.success(f"**Best Entry Slot:**\n### {top.get('label', '—')}")
     with col2:
-        st.info(f"**Avg Return:**\n### {top_avg:.3f}%")
+        st.info(f"**Avg Return:**\n### {top['avg']:.3f}%")
     with col3:
-        st.warning(f"**Win Rate (N={top_n}):**\n### {top_wr:.1f}%")
+        st.warning(f"**Win Rate (N={int(top['count'])}):**\n### {top['win_rate']:.1f}%")
     with col4:
-        kelly_display = f"{top_kelly:.1%}" if not np.isnan(top_kelly) else "N/A"
-        st.info(f"**Kelly Size:**\n### {kelly_display}")
-
-    if not np.isnan(top_sharpe):
+        kelly_str = f"{top['kelly']:.1%}" if not np.isnan(top.get('kelly', float('nan'))) else "N/A"
+        st.info(f"**Kelly Size:**\n### {kelly_str}")
+    sharpe = top.get('sharpe', float('nan'))
+    if not np.isnan(sharpe):
         st.caption(
-            f"Annualised Sharpe: **{top_sharpe:.2f}** | "
-            f"Profit Factor: **{top_slot.get('profit_factor', float('nan')):.2f}** | "
-            f"t-stat: **{top_slot.get('t_stat', float('nan')):.2f}** | "
-            f"p-value: **{top_slot.get('p_value', float('nan')):.4f}**"
+            f"Sharpe: **{sharpe:.2f}** | "
+            f"Profit Factor: **{top.get('profit_factor', float('nan')):.2f}** | "
+            f"t-stat: **{top.get('t_stat', float('nan')):.2f}** | "
+            f"p-value: **{top.get('p_value', float('nan')):.4f}**"
         )
 else:
-    st.info("Refine filters above to surface a statistically significant recommendation.")
+    st.info("Refine filters to surface a statistically significant recommendation.")
 
 
 # ─────────────────────────────────────────────
@@ -268,56 +251,47 @@ st.subheader(f"Cumulative Weekly Path — Median & 10th/90th Percentile ({tz_mod
 
 fig = go.Figure()
 
-# 10th–90th percentile band
 if "p10" in PathData.columns and "p90" in PathData.columns:
     fig.add_trace(go.Scatter(
-        x=PathData.index, y=PathData["p90"],
-        mode="lines", line=dict(color="rgba(31,119,180,0)", width=0),
-        showlegend=False, hoverinfo="skip", name="p90"
+        x=PathData.index, y=PathData["p90"], mode="lines",
+        line=dict(color="rgba(31,119,180,0)", width=0),
+        showlegend=False, hoverinfo="skip"
     ))
     fig.add_trace(go.Scatter(
-        x=PathData.index, y=PathData["p10"],
-        mode="lines", line=dict(color="rgba(31,119,180,0)", width=0),
-        fill="tonexty",
-        fillcolor="rgba(31,119,180,0.12)",
-        showlegend=True, name="10th–90th pct",
-        hoverinfo="skip"
+        x=PathData.index, y=PathData["p10"], mode="lines",
+        line=dict(color="rgba(31,119,180,0)", width=0),
+        fill="tonexty", fillcolor="rgba(31,119,180,0.12)",
+        showlegend=True, name="10th–90th pct", hoverinfo="skip"
     ))
 
-# Mean path
 fig.add_trace(go.Scatter(
-    x=PathData.index, y=PathData["avg"],
-    mode="lines", name="Mean path",
+    x=PathData.index, y=PathData["avg"], mode="lines", name="Mean path",
     line=dict(color="#1f77b4", width=2.5),
     text=PathData.get("label", PathData.index),
     customdata=np.stack([
-        PathData.get("win_rate",   pd.Series(np.nan, index=PathData.index)),
-        PathData.get("t_stat",     pd.Series(np.nan, index=PathData.index)),
-        PathData.get("count",      pd.Series(np.nan, index=PathData.index)),
+        PathData.get("win_rate",      pd.Series(np.nan, index=PathData.index)),
+        PathData.get("t_stat",        pd.Series(np.nan, index=PathData.index)),
+        PathData.get("count",         pd.Series(np.nan, index=PathData.index)),
         PathData.get("profit_factor", pd.Series(np.nan, index=PathData.index)),
     ], axis=-1),
     hovertemplate=(
-        "<b>%{text}</b><br>"
-        "Avg Move: %{y:.3f}%<br>"
+        "<b>%{text}</b><br>Avg: %{y:.3f}%<br>"
         "Win Rate: %{customdata[0]:.1f}%<br>"
         "t-stat: %{customdata[1]:.2f}<br>"
         "N: %{customdata[2]:.0f}<br>"
-        "Profit Factor: %{customdata[3]:.2f}"
-        "<extra></extra>"
+        "PF: %{customdata[3]:.2f}<extra></extra>"
     )
 ))
 
-# Median path
 if "median" in PathData.columns:
     fig.add_trace(go.Scatter(
-        x=PathData.index, y=PathData["median"],
-        mode="lines", name="Median path",
-        line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+        x=PathData.index, y=PathData["median"], mode="lines",
+        name="Median path", line=dict(color="#ff7f0e", width=1.5, dash="dot"),
         hoverinfo="skip"
     ))
 
 tick_vals = [24, 48, 72, 96, 120]
-tick_text = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+tick_text = ["Mon","Tue","Wed","Thu","Fri"]
 for x_val in tick_vals:
     fig.add_vline(x=x_val, line_width=1, line_dash="dash", line_color="gray")
 
@@ -331,11 +305,11 @@ st.plotly_chart(fig, use_container_width=True)
 
 
 # ─────────────────────────────────────────────
-# SECTION 4: HEATMAP  (NaN cells = grey)
+# SECTION 4: HEATMAP
 # ─────────────────────────────────────────────
 st.markdown("---")
 st.subheader(f"Intraday Heatmap — Mean Daily Return % ({tz_mode})")
-st.caption("Grey cells = insufficient data (< min observations). Not filled with 0.")
+st.caption("Grey cells = no data (holiday / outside session). Not filled with 0%.")
 
 max_hm_val = HeatmapData.abs().max().max()
 fig_hm = px.imshow(
@@ -350,7 +324,7 @@ st.plotly_chart(fig_hm, use_container_width=True)
 
 
 # ─────────────────────────────────────────────
-# SECTION 5: DAILY PERFORMANCE  (extended metrics)
+# SECTION 5: DAILY PERFORMANCE + VOLATILITY
 # ─────────────────────────────────────────────
 st.markdown("---")
 col_chart1, col_chart2 = st.columns(2)
@@ -360,32 +334,28 @@ with col_chart1:
     if "win_rate" in DailyPerf.columns:
         colors = ["#2ca02c" if w >= 55 else "#d62728" for w in DailyPerf["win_rate"]]
         fig_win = go.Figure(data=[
-            go.Bar(name="Win Rate", x=DailyPerf.index,
-                   y=DailyPerf["win_rate"], marker_color=colors,
-                   customdata=DailyPerf.get("count", pd.Series(dtype=float)),
-                   hovertemplate="<b>%{x}</b><br>Win Rate: %{y:.1f}%<br>N: %{customdata:.0f}<extra></extra>")
+            go.Bar(
+                name="Win Rate", x=DailyPerf.index, y=DailyPerf["win_rate"],
+                marker_color=colors,
+                customdata=DailyPerf.get("count", pd.Series(dtype=float)),
+                hovertemplate="<b>%{x}</b><br>Win Rate: %{y:.1f}%<br>N: %{customdata:.0f}<extra></extra>"
+            )
         ])
         fig_win.add_hline(y=50, line_dash="dash", line_color="red",
                           annotation_text="Breakeven 50%")
         fig_win.add_hline(y=55, line_dash="dot", line_color="orange",
-                          annotation_text="Institutional Edge 55%")
+                          annotation_text="Edge threshold 55%")
         fig_win.update_layout(yaxis_title="Win Rate (%)", margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig_win, use_container_width=True)
 
-    if "profit_factor" in DailyPerf.columns and "kelly" in DailyPerf.columns:
-        st.caption("Extended daily metrics:")
-        disp_cols = [c for c in ["avg", "win_rate", "profit_factor",
-                                 "sharpe", "sortino", "kelly", "count"]
-                     if c in DailyPerf.columns]
+    disp_cols = [c for c in
+        ["avg","win_rate","profit_factor","sharpe","sortino","kelly","count"]
+        if c in DailyPerf.columns]
+    if disp_cols:
         st.dataframe(
             DailyPerf[disp_cols].style.format({
-                "avg":           "{:.3f}%",
-                "win_rate":      "{:.1f}%",
-                "profit_factor": "{:.2f}",
-                "sharpe":        "{:.2f}",
-                "sortino":       "{:.2f}",
-                "kelly":         "{:.3f}",
-                "count":         "{:.0f}",
+                "avg":"{:.3f}%","win_rate":"{:.1f}%","profit_factor":"{:.2f}",
+                "sharpe":"{:.2f}","sortino":"{:.2f}","kelly":"{:.3f}","count":"{:.0f}"
             }),
             use_container_width=True
         )
