@@ -1,0 +1,3 @@
+# bot/__init__.py
+# Makes bot/ a proper Python package so all sub-modules can do:
+#   from bot.config_bot import ...
