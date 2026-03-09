@@ -1,0 +1,13 @@
+# bot/requirements_bot.txt
+# Additional dependencies required by the trading bot.
+# The main requirements.txt already covers: requests, pandas, numpy,
+# pytz, python-dotenv, yfinance.
+#
+# Install with:
+#   pip install -r bot/requirements_bot.txt
+
+# Job scheduling (cron-based seasonal entry jobs)
+apscheduler>=3.10
+
+# OpenAI API for news sentiment scoring
+openai>=1.0
