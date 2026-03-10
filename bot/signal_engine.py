@@ -114,12 +114,14 @@ def compute_seasonal_score(
         return _empty
 
     # Find the CT slot closest to entry_ct (within ±30 min = ±0.5 CT units)
-    delta = (path_data.index - entry_ct).abs()
+    # Use numpy for index arithmetic — works regardless of pandas Index subtype
+    ct_arr = np.array(path_data.index, dtype=float)
+    delta  = np.abs(ct_arr - float(entry_ct))
     if delta.min() > 0.5:
         logger.warning(f"[{symbol}] No path_data slot within 30 min of CT={entry_ct:.2f}")
         return _empty
 
-    slot = path_data.loc[delta.idxmin()]
+    slot = path_data.iloc[int(delta.argmin())]
     avg = float(slot.get("avg", 0.0))
 
     if pd.isna(avg):
